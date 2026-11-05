@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 
 from . import guardrails
-from .composer import ClaudeComposer, OllamaComposer, compose_template
+from .composer import ClaudeComposer, OllamaComposer, OpenAIComposer, compose_template
 from .policy import decide, inbound_text, is_stop_request
 
 # --------------------------------------------------------------------------
@@ -64,9 +64,9 @@ def select_examples(record: dict, pool: list[dict], k: int = 4) -> list[dict]:
 class MessagingAgent:
     def __init__(self, examples: list[dict] | None = None, llm: str | None = None,
                  model: str | None = None, max_repairs: int = 1, now: datetime | None = None):
-        """llm: None (offline templates) | "ollama" (free, local) | "claude" (Anthropic API)."""
+        """llm: None (offline templates) | "ollama" (free, local) | "openai" | "claude"."""
         self.examples = examples or []
-        self.llm = {"ollama": OllamaComposer, "claude": ClaudeComposer}[llm](model=model) if llm else None
+        self.llm = {"ollama": OllamaComposer, "openai": OpenAIComposer, "claude": ClaudeComposer}[llm](model=model) if llm else None
         self.max_repairs = max_repairs
         self.now = now
 

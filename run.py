@@ -7,7 +7,8 @@
   # with a free local LLM (Ollama) composing the copy, few-shot from the training file
   python run.py data/holdout.jsonl --llm --examples data/sample.jsonl --out outputs/holdout_outputs.jsonl
 
-  # same, with Claude
+  # same, with OpenAI or Claude (needs OPENAI_API_KEY / ANTHROPIC_API_KEY)
+  python run.py data/holdout.jsonl --llm openai --examples data/sample.jsonl
   python run.py data/holdout.jsonl --llm claude --examples data/sample.jsonl
 
 Hold-out records without `expected` are just answered; records with `expected` are also scored.
@@ -46,9 +47,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("input", help="JSONL of test cases")
     ap.add_argument("--examples", default=None, help="training JSONL for few-shot (default: the input file itself, leave-one-out)")
-    ap.add_argument("--llm", nargs="?", const="ollama", choices=["ollama", "claude"], default=None,
-                    help="LLM for copy: ollama (free, local; default when flag given) or claude (needs Anthropic key)")
-    ap.add_argument("--model", default=None, help="model id (ollama default qwen2.5:7b, claude default claude-opus-5-5)")
+    ap.add_argument("--llm", nargs="?", const="ollama", choices=["ollama", "openai", "claude"], default=None,
+                    help="LLM for copy: ollama (free, local; default when flag given), openai (OPENAI_API_KEY) or claude (ANTHROPIC_API_KEY)")
+    ap.add_argument("--model", default=None, help="model id (defaults: ollama qwen2.5:7b, openai gpt-5-mini, claude claude-opus-5-5)")
     ap.add_argument("--out", default="outputs/outputs.jsonl")
     ap.add_argument("--full", action="store_true", help="print full output incl. trace")
     args = ap.parse_args()

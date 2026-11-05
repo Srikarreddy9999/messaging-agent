@@ -243,6 +243,38 @@ class OllamaComposer:
         return _strip_nulls(json.loads(data["message"]["content"]))
 
 
+class OpenAIComposer:
+    """OpenAI API via the official SDK. Needs OPENAI_API_KEY (an API key from platform.openai.com;
+    a ChatGPT subscription does not include API access). Uses strict JSON-schema structured outputs."""
+
+    def __init__(self, model: str | None = None):
+        from openai import OpenAI  # imported lazily so other modes don't need the SDK
+
+        self.client = OpenAI()  # reads OPENAI_API_KEY (and OPENAI_BASE_URL if set)
+        self.model = model or os.environ.get("OPENAI_MODEL", "gpt-5-mini")
+
+    def compose(self, record: dict, d: Decision, examples: list[dict], feedback: list[str] | None = None) -> dict:
+        kwargs = dict(
+            model=self.model,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                      {"role": "user", "content": build_user_prompt(record, d, examples, feedback)}],
+            response_format={"type": "json_schema",
+                             "json_schema": {"name": "next_step", "strict": True, "schema": OUTPUT_SCHEMA}},
+            max_completion_tokens=4000,
+        )
+        if self.model.startswith(("gpt-5", "o")):
+            kwargs["reasoning_effort"] = "low"  # reasoning models: keep latency down
+        else:
+            kwargs["temperature"] = 0
+        resp = self.client.chat.completions.create(**kwargs)
+        choice = resp.choices[0]
+        if getattr(choice.message, "refusal", None):
+            raise RuntimeError(f"model refused: {choice.message.refusal}")
+        if choice.finish_reason == "length":
+            raise RuntimeError("model output truncated (length)")
+        return _strip_nulls(json.loads(choice.message.content))
+
+
 class ClaudeComposer:
     def __init__(self, model: str | None = None, effort: str = "low"):
         import anthropic  # imported lazily so offline mode needs no SDK

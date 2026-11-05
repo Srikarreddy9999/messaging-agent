@@ -15,11 +15,27 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # free local LLM (Ollama, no key): one-time `ollama pull qwen2.5:7b`
 .venv/bin/python run.py data/holdout.jsonl --llm --examples data/sample.jsonl --out outputs/holdout.jsonl
 
+# OpenAI instead (needs OPENAI_API_KEY from platform.openai.com; default model gpt-5-mini, change with --model)
+.venv/bin/python run.py data/holdout.jsonl --llm openai --examples data/sample.jsonl --out outputs/holdout.jsonl
+
 # Claude instead (needs ANTHROPIC_API_KEY)
 .venv/bin/python run.py data/holdout.jsonl --llm claude --examples data/sample.jsonl --out outputs/holdout.jsonl
 
 .venv/bin/python tests/test_agent.py
 ```
+
+**Windows (PowerShell)**: the venv lives in `.venv\Scripts`, and you always run `run.py` with a data file.
+Don't run `agent\agent.py` directly: it's a package module, so that gives "attempted relative import".
+
+```powershell
+py -m venv .venv; .venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python run.py data\sample.jsonl
+$env:OPENAI_API_KEY = "sk-..."   # current terminal only
+.venv\Scripts\python run.py data\holdout.jsonl --llm openai --examples data\sample.jsonl --out outputs\holdout.jsonl
+```
+
+A ChatGPT subscription does not include API access. The API is billed separately and prepaid; a few dollars
+of credit covers this many times over. If no LLM is available, run without `--llm` to get the offline answers.
 
 `run.py` prints one JSON object per case (copy-paste ready), writes all of them to `--out`, and if a case
 has `expected` it prints a scorecard. `--full` adds the decision trace.
@@ -37,7 +53,7 @@ record ──► policy.decide()  ──► composer (Claude few-shot │ templa
 | Layer | File | Why it is separate |
 |---|---|---|
 | Policy | `agent/policy.py` | Consent, channel, quiet hours, send-time math, and opt-out wording are compliance decisions. They have to be right every time, so they're code, not prompts. |
-| Composer | `agent/composer.py` | Copy is where "semantic match" applies. The LLM gets the most similar training cases as few-shot examples plus the policy output as constraints, and returns a strict JSON schema. There are two interchangeable backends with the same prompt: **Ollama** (local `qwen2.5:7b`, free, uses Ollama's JSON-schema `format`) and **Claude** (structured outputs). The LLM writes only the copy. Its proposed `next_action` is logged, but the policy decides it. |
+| Composer | `agent/composer.py` | Copy is where "semantic match" applies. The LLM gets the most similar training cases as few-shot examples plus the policy output as constraints, and returns a strict JSON schema. There are three interchangeable backends with the same prompt: **Ollama** (local `qwen2.5:7b`, free, uses Ollama's JSON-schema `format`), **OpenAI** (strict `json_schema` response format) and **Claude** (structured outputs). The LLM writes only the copy. Its proposed `next_action` is logged, but the policy decides it. |
 | Guardrails | `agent/guardrails.py` | Every message is checked for consent, Fair Housing language, PII leaks (regex plus non-allowlisted profile values echoed back), opt-out text, channel shape (SMS ≤320 chars with no subject; email needs a subject), CTA presence (numbered SMS options, email link), and brand style. Two checks catch details the model copies from the examples: a greeting with a name that isn't this contact's, and amenities the contact never asked about. A failure triggers a retry with the violations as feedback, then the template as a last resort. |
 | Orchestrator | `agent/agent.py` | Ties the layers together and measures latency. It also handles inbound replies. Opt-outs, including natural phrasing like "please stop texting me" but not "stop by", suppress marketing and send one SMS confirmation. "Not interested" closes the lead with no message. A picked option ("1") gets a tour confirmation, and anything else is acknowledged and handed to a leasing agent. |
 | Robustness | `run.py`, `policy.py` | A record that can't be processed becomes `next_action: manual_review` with nothing sent; it never stops the batch. Inputs are parsed defensively: timezone abbreviations, naive or epoch timestamps, unknown or string channels, and non-string fields. |
