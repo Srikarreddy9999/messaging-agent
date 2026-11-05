@@ -11,16 +11,33 @@ import re
 
 # Fair Housing Act: never steer by race, color, religion, sex, national origin,
 # familial status or disability (plus common state-level additions).
+# Steering phrases, not bare words: "White Oak Apartments", a contact named Christian, a senior
+# leasing consultant or a kids' play area are all fine. Names and the property name are also
+# masked before matching (see _mask_names).
+_GROUPS = (r"(famil(y|ies)|couples?|singles?|young professionals|students|retirees|seniors|kids|children|"
+           r"christians?|catholics?|jews|jewish|muslims?|hindus?|immigrants?|men|women|bachelors?)")
 FAIR_HOUSING_PATTERNS = [
-    r"\bfamil(y|ies)[- ]friendly\b", r"\bperfect for (families|couples|singles|young professionals|students|retirees)\b",
-    r"\bno (kids|children)\b", r"\badults? only\b", r"\b(kids|children)\b", r"\bsingles?\b(?! (story|level|family))",
-    r"\bmature (couple|person|individuals)\b", r"\bempty[- ]nesters?\b", r"\bretirees?\b", r"\bseniors?\b",
-    r"\bchristians?\b", r"\bmuslims?\b", r"\bjewish\b", r"\bchurch(es)?\b", r"\bsynagogues?\b", r"\bmosques?\b",
-    r"\bwhite\b", r"\bblack\b", r"\bhispanic\b", r"\blatino\b", r"\basian\b", r"\bethnic\b", r"\brace\b",
-    r"\bdisabled\b", r"\bhandicap(ped)?\b", r"\bable[- ]bodied\b", r"\bwheelchair\b", r"\bpregnan(t|cy)\b",
-    r"\bno section 8\b", r"\bexclusive neighborhood\b", r"\bsafe neighborhood\b", r"\bnationality\b", r"\bimmigrants?\b",
-    r"\bbachelor pad\b", r"\bman cave\b", r"\bideal for\b",
+    r"\bfamil(y|ies)[- ]friendly\b", rf"\b(perfect|ideal|great|best|suited|suitable|designed) for {_GROUPS}\b",
+    r"\bno (kids|children|families|pets and kids)\b", r"\badults?[- ]only\b", r"\bmature (couple|person|individuals|adults?)\b",
+    r"\bempty[- ]nesters?\b", r"\b(christian|catholic|jewish|muslim|hindu) (community|neighborhood|area|residents|families)\b",
+    r"\b(white|black|hispanic|latino|latina|asian|ethnic|integrated) (neighborhood|community|area|tenants|residents|families)\b",
+    r"\b(no|not suitable for|not accessible to) (wheelchairs?|disabled|handicapped)\b", r"\bable[- ]bodied\b",
+    r"\bpregnan(t|cy)\b", r"\bno section 8\b", r"\bexclusive (neighborhood|community)\b", r"\bsafe neighborhood\b",
+    r"\bnationality\b", r"\benglish[- ]speaking only\b", r"\bbachelor pad\b", r"\bman cave\b",
 ]
+
+
+def _mask_names(text: str, record: dict) -> str:
+    inp = record.get("input") or {}
+    prof = inp.get("profile") or {}
+    for v in (prof.get("first_name"), prof.get("preferred_name"), prof.get("last_name"),
+              inp.get("property_name"), prof.get("city_interest")):
+        if v:
+            text = re.sub(re.escape(str(v)), " ", text, flags=re.I)
+            short = re.sub(r"\s+(Apartments|Apartment Homes|Apts\.?|Residences|Homes|Lofts)$", "", str(v), flags=re.I)
+            text = re.sub(re.escape(short), " ", text, flags=re.I)
+    return text
+
 
 PII_PATTERNS = {
     "email_address": r"[\w.+-]+@[\w-]+\.[\w.-]+",
@@ -38,7 +55,9 @@ AMENITY_TERMS = {"pool": r"\b(pool|piscina|alberca)\b", "fitness": r"\b(fitness|
                  "dog": r"\b(dog park|parque para perros)\b", "rooftop": r"\brooftop\b"}
 
 SMS_MAX_CHARS = 320  # two segments
-OPT_OUT_MARKERS = ("stop", "opt out", "unsubscribe", "cancelar", "presione 9", "press 9")
+# a bare "stop" is not enough ("stop by for a tour!")
+OPT_OUT_RE = re.compile(r"(reply|text|send|responde|say|diga)\s+['\"]?stop|\bopt[- ]?out\b|\bunsubscribe\b|"
+                        r"\bstop to (opt|unsubscribe|end)|\bpress(ione)? 9\b|\bcancelar\b", re.I)
 
 
 def apply_brand_style(text: str) -> str:
@@ -83,12 +102,13 @@ def check(record: dict, decision, message: dict | None) -> tuple[list[str], list
         violations.append(f"channel {message.get('channel')} lacks consent")
 
     # fair housing
-    hits = [p for p in FAIR_HOUSING_PATTERNS if re.search(p, low)]
+    masked = _mask_names(text, record).lower()
+    hits = [p for p in FAIR_HOUSING_PATTERNS if re.search(p, masked)]
     # also: never echo a protected attribute that happens to be in the input
     inp = record.get("input") or {}
     for path, val in _strings(inp.get("profile") or {}):
         key = path.split(".")[0]
-        if key not in ALLOWED_PROFILE_KEYS and len(val) > 2 and val.lower() in low:
+        if key not in ALLOWED_PROFILE_KEYS and len(val) >= 2 and re.search(rf"\b{re.escape(val.lower())}\b", low):
             violations.append(f"pii/protected value from profile.{path} appears in message")
     if hits:
         violations.append(f"fair housing: {hits}")
@@ -108,7 +128,7 @@ def check(record: dict, decision, message: dict | None) -> tuple[list[str], list
         states.append("no_pii_leak")
 
     # opt-out
-    if constraints.get("include_opt_out_instructions", True) and not any(m in low for m in OPT_OUT_MARKERS):
+    if constraints.get("include_opt_out_instructions", True) and not OPT_OUT_RE.search(text):
         violations.append("missing opt-out instructions")
 
     # channel shape
@@ -134,16 +154,17 @@ def check(record: dict, decision, message: dict | None) -> tuple[list[str], list
     # CTA alignment
     # greeting must use the record's name (or none) — catches names copied from the few-shot examples
     prof = (record.get("input") or {}).get("profile") or {}
-    allowed = {n.lower() for n in (prof.get("first_name"), prof.get("preferred_name")) if n}
+    allowed = {str(n).lower() for n in (prof.get("first_name"), prof.get("preferred_name")) if n}
     m = re.match(r"\s*(hi|hello|hey|hola|dear)\s+([A-ZÁÉÍÓÚÑ][\wáéíóúñ]+)", body, re.I)
     if m and m.group(2).lower() not in allowed | {"there"}:
         violations.append(f"greeting uses name '{m.group(2)}' which is not this contact's first name"
                           + ("" if allowed else "; record has no name, greet with 'Hi there'"))
 
     # only mention amenities the contact asked about (small models copy them from the examples)
-    asked = " ".join(prof.get("amenity_interest") or []).lower()
+    asked = " ".join(str(a) for a in (prof.get("amenity_interest") or [])).lower().replace("gym", "fitness")
+    amen_text = _mask_names(text, record).lower()
     for key, pat in AMENITY_TERMS.items():
-        if re.search(pat, low) and key not in asked:
+        if re.search(pat, amen_text) and key not in asked:
             violations.append(f"mentions amenity '{key}' the contact never asked about")
 
     if decision.cta_type == "schedule_tour" and not re.search(r"\b(tour|visit|book|schedule|recorrido|visita|reserv)", low):

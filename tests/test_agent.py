@@ -78,6 +78,35 @@ def test_reply_classifier():
     assert classify_reply("how much is a 2br?") == "pricing_question"
 
 
+def test_review_regressions():
+    agent = MessagingAgent(examples=SAMPLE)
+    base = {k: v for k, v in SAMPLE[0].items() if k != "expected"}
+
+    def variant(**changes):
+        r = json.loads(json.dumps(base))
+        for path, val in changes.items():
+            *head, last = path.split("__")
+            node = r
+            for h in head:
+                node = node[h]
+            node[last] = val
+        return agent.run(r)
+
+    # bad inputs no longer crash
+    assert variant(input__timezone="CST")["next_message"]["send_at"].endswith("-06:00")
+    assert variant(channel_preferences=["whatsapp", None, "SMS"])["next_message"]["channel"] == "sms"
+    assert variant(input__last_interaction=1765206240)["next_message"] is not None
+    # natural opt-out suppresses marketing; "stop by" does not
+    assert variant(input__inbound_message="please stop texting me")["next_action"]["type"] == "opt_out"
+    assert classify_reply("Can I stop by Saturday for a tour?") != "opt_out"
+    # not interested closes the lead without a message
+    out = variant(input__inbound_message="No thanks, found another place")
+    assert out["next_message"] is None and out["next_action"]["type"] == "close_lead"
+    # names that contain protected-class words are not Fair Housing violations
+    out = variant(input__profile={"first_name": "Christian"}, input__property_name="White Oak Apartments")
+    assert out["violations"] == [] and "fair_housing_check_passed" in out["states"]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

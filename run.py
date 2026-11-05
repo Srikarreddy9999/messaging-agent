@@ -54,21 +54,25 @@ def main() -> None:
     agent = MessagingAgent(examples=examples, llm=args.llm, model=args.model)
 
     outputs, scores = [], []
-    for r in records:
-        out = agent.run(r)
-        outputs.append(out)
-        if "expected" in r:
-            scores.append(score(r, out))
-
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
-        for o in outputs:
-            f.write(json.dumps(o, ensure_ascii=False) + "\n")
-
-    # Copy-paste friendly: the answer fields only, one per case
-    for o in outputs:
-        view = o if args.full else {k: o[k] for k in ("task_id", "next_message", "next_action", "rationale", "states")}
-        print(json.dumps(view, ensure_ascii=False, indent=2))
+        for r in records:
+            # One bad record must never cost the other outputs.
+            try:
+                out = agent.run(r)
+            except Exception as e:  # noqa: BLE001
+                out = {"task_id": r.get("task_id") if isinstance(r, dict) else None, "next_message": None,
+                       "next_action": {"type": "manual_review", "reason": f"agent error: {e!r}"},
+                       "rationale": "Could not process this record safely, so nothing is sent.",
+                       "states": [], "violations": [], "meta": {"latency_ms": 0.0, "trace": [repr(e)]}}
+            outputs.append(out)
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
+            f.flush()
+            # Copy-paste friendly: the answer fields only, printed as each case finishes
+            view = out if args.full else {k: out.get(k) for k in ("task_id", "next_message", "next_action", "rationale", "states")}
+            print(json.dumps(view, ensure_ascii=False, indent=2), flush=True)
+            if isinstance(r, dict) and "expected" in r:
+                scores.append(score(r, out))
 
     lat = [o["meta"]["latency_ms"] for o in outputs]
     print(f"\n{len(outputs)} cases -> {args.out}", file=sys.stderr)

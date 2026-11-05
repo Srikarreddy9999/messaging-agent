@@ -24,13 +24,27 @@ def _join(items: list[str], conj: str = "and") -> str:
     return ", ".join(items[:-1]) + f" {conj} " + items[-1]
 
 
-def _move_phrase(move: str | None) -> str | None:
+def _move_phrase(move) -> str | None:
     try:
-        d = date.fromisoformat(move[:10])
+        d = date.fromisoformat(str(move)[:10])
     except (TypeError, ValueError):
         return None
     part = "early" if d.day <= 10 else "mid" if d.day <= 20 else "late"
-    return f"{part}‑{d.strftime('%B')}"  # non-breaking hyphen, matches sample style
+    return f"{part}\u2011{d.strftime('%B')}"  # non-breaking hyphen, matches sample style
+
+
+# Generic phrasing for CTAs other than tours (not in the samples; kept plain and neutral).
+CTA_PHRASE = {
+    "apply_now": ("Ready to apply? You can start your application online.", "Apply now"),
+    "renew_lease": ("Your lease renewal options are ready to review.", "Review renewal"),
+    "pay_rent": ("A quick reminder that rent is due soon.", "Pay now"),
+    "submit_maintenance": ("Need something fixed? Submit a maintenance request anytime.", "Submit request"),
+}
+
+
+def _amenity_key(a: str) -> str:
+    a = str(a).lower()
+    return "fitness" if a in ("gym", "fitness_center", "fitness") else a
 
 
 # ---------------------------------------------------------------------------
@@ -41,55 +55,57 @@ def compose_template(record: dict, d: Decision) -> dict:
     prof = inp.get("profile") or {}
     first = prof.get("preferred_name") or prof.get("first_name")
     hi = f"Hi {first}" if first else "Hi there"
+    hola = hi.replace("Hi there", "Hola").replace("Hi ", "Hola ")
     prop = short_property_name(inp.get("property_name"))
-    stage = (record.get("lifecycle_stage") or "").lower()
-    amenities = prof.get("amenity_interest") or []
+    stage = str(record.get("lifecycle_stage") or "").lower()
+    amenities = [_amenity_key(a) for a in (prof.get("amenity_interest") or []) if a]
     es = d.language == "es"
+    tour = d.cta_type == "schedule_tour"
 
     subject = None
     cta: dict = {"type": d.cta_type} if d.cta_type else {}
 
     if d.channel == "sms":
-        if d.cta_type == "schedule_tour" and d.cta_options:
+        if tour and d.cta_options:
             o1, o2 = d.cta_options
             l1, l2 = d.cta_option_labels
             when_en = "this week" if d.cta_same_week else "next week"
             when_es = "esta semana" if d.cta_same_week else "la próxima semana"
             if es:
-                opener = f"{hi.replace('Hi', 'Hola')}—¡bienvenido a {prop}!" if stage == "new" else f"{hi.replace('Hi', 'Hola')}—gracias por tu interés en {prop}."
-                body = f"{opener} Hay recorridos disponibles {when_es}. ¿Te gustaría reservar el {l1} o el {l2}? Responde 1 para {o1}, 2 para {o2}. {d.opt_out_text}"
+                opener = f"{hola}—¡te damos la bienvenida a {prop}!" if stage == "new" else f"{hola}—gracias por tu interés en {prop}."
+                body = f"{opener} Hay recorridos disponibles {when_es}. ¿Te gustaría reservar el {l1} o el {l2}? Responde 1 para {l1}, 2 para {l2}. {d.opt_out_text}"
             else:
                 opener = f"{hi}—welcome to {prop}!" if stage == "new" else f"{hi}—still planning your move? {prop} has tours open."
                 body = f"{opener} Tours are available {when_en}. Would you like to book a time on {l1} or {l2}? Reply 1 for {o1}, 2 for {o2}. {d.opt_out_text}"
             cta["options"] = list(d.cta_options)
         else:
-            body = f"{hi}—a quick update from {prop}. Reply with any questions. {d.opt_out_text}"
+            line, _ = CTA_PHRASE.get(d.cta_type, ("Reply with any questions—we’re happy to help.", ""))
+            body = f"{hi}—a quick note from {prop}. {line} {d.opt_out_text}"
     elif d.channel == "email":
         am_long = [AMENITY_PHRASE.get(a, a.replace("_", " ")) for a in amenities]
         am_short = [AMENITY_SHORT.get(a, AMENITY_PHRASE.get(a, a.replace("_", " "))) for a in amenities]
-        move = _move_phrase(inp.get("move_date_target"))
-        if es:
+        move = _move_phrase(inp.get("move_date_target")) if d.horizon != "unknown" else None
+        link_line = lambda label: [f"{label} → {d.cta_link}"] if d.cta_link else []
+        if not tour:
+            line, label = CTA_PHRASE.get(d.cta_type, (f"Here’s a quick update from {prop}.", "Learn more"))
+            subject = f"{prop}—{label}" if d.cta_type in CTA_PHRASE else f"An update from {prop}"
+            lines = [f"{hi},", line] + link_line(label) + [d.opt_out_text]
+        elif es:
             subject = f"Visita {prop}—conoce lo que te interesa"
-            lines = [f"{hi.replace('Hi', 'Hola')},",
-                     f"Reserva una visita esta semana para comparar planos en {prop}.",
-                     f"Reservar → {d.cta_link}", d.opt_out_text]
+            lines = [f"{hola},", f"Reserva una visita esta semana para comparar planos en {prop}."] + link_line("Reservar") + [d.opt_out_text]
         else:
-            if am_short:
-                subject = f"Tour {prop}—See the {' & '.join(am_short)} you asked about"
-            else:
-                subject = f"Tour {prop}—Find your next home"
+            subject = f"Tour {prop}—See the {' & '.join(am_short)} you asked about" if am_short else f"Tour {prop}—Find your next home"
             article = "an" if move and move[0] in "aeiou" else "a"
             intro = f"Since you’re planning {article} {move} move, " if move else ""
             look = f"here’s a quick look at our {_join(am_long)}." if am_long else f"here’s a quick look at {prop}."
             look = look[0].upper() + look[1:] if not intro else look
-            lines = [f"{hi},", f"{intro}{look} Book a visit this week to compare floor plans.",
-                     f"Book now → {d.cta_link}", d.opt_out_text]
+            lines = [f"{hi},", f"{intro}{look} Book a visit this week to compare floor plans."] + link_line("Book now") + [d.opt_out_text]
         body = "\n".join(lines)
         if d.cta_link:
             cta["link"] = d.cta_link
     else:  # voice script
-        body = (f"{hi}, this is the leasing team at {prop}. We’d love to show you around—"
-                f"call us back or reply to book a tour this week. {d.opt_out_text}")
+        ask = "call us back to book a tour this week" if tour else "call us back anytime with questions"
+        body = f"{hi}, this is the team at {prop}—{ask}. {d.opt_out_text}"
         cta = {"type": d.cta_type or "callback"}
 
     return {"channel": d.channel, "send_at": d.send_at, "subject": subject, "body": body, "cta": cta}

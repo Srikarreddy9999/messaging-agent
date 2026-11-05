@@ -1,6 +1,7 @@
 """Orchestrator: policy -> compose (LLM or template) -> guardrails -> repair -> output."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import time
@@ -8,13 +9,13 @@ from datetime import datetime
 
 from . import guardrails
 from .composer import ClaudeComposer, OllamaComposer, compose_template
-from .policy import STOP_WORDS, decide, inbound_text
+from .policy import decide, inbound_text, is_stop_request
 
 # --------------------------------------------------------------------------
 # Reply classification (the thresholds mention reply_classification_f1)
 # --------------------------------------------------------------------------
 REPLY_RULES = [
-    ("opt_out", r"^\s*(stop|stopall|unsubscribe|cancel|end|quit|opt ?out|remove me)\W*$"),
+    ("opt_out", r"^\s*(cancel|end|quit)\W*$"),
     ("select_option", r"^\s*[1-9]\s*$"),
     ("schedule_tour", r"\b(tour|visit|see the (place|unit)|come by|book)\b"),
     ("reschedule", r"\b(reschedule|another time|different (day|time)|can'?t make it)\b"),
@@ -27,7 +28,7 @@ REPLY_RULES = [
 
 def classify_reply(text: str) -> str:
     low = text.lower().strip()
-    if low.strip(".! ") in STOP_WORDS:
+    if is_stop_request(low):
         return "opt_out"
     for label, pat in REPLY_RULES:
         if re.search(pat, low):
@@ -46,7 +47,7 @@ def _features(r: dict) -> set[str]:
     f |= {f"{k}={v}" for k, v in c.items()}
     f |= {f"inkey={k}" for k in inp}
     f |= {f"profkey={k}" for k in (inp.get("profile") or {})}
-    f |= {f"tid={t}" for t in re.split(r"[_\-]", r.get("task_id", "")) if t}
+    f |= {f"tid={t}" for t in re.split(r"[_\-]", str(r.get("task_id") or "")) if t}
     cta = ((r.get("assertions") or {}).get("constraints") or {}).get("primary_cta")
     f.add(f"cta={cta}")
     return f
@@ -79,6 +80,16 @@ class MessagingAgent:
             trace.append(f"inbound reply classified as {reply_label!r}")
 
         message, next_action, rationale, source = None, d.next_action, None, "policy"
+
+        if d.should_send and reply_label and reply_label != "opt_out":
+            # The contact just wrote back: answer that, don't send the next cadence step.
+            message, next_action, rationale = self._reply_response(record, d, reply_label, reply)
+            source = "reply_handler"
+            # tour-invite rules (numbered options, tour wording) don't apply to an acknowledgement
+            ack = dataclasses.replace(d, cta_type=None, cta_options=[], cta_option_labels=[], cta_link=None)
+            states, violations = guardrails.check(record, ack, message)
+            return self._result(record, message, next_action, rationale, states, violations,
+                                reply_label, source, t0, trace)
 
         if not d.should_send:
             if d.suppress_reason == "opted_out" and reply_label == "opt_out" and record.get("consent", {}).get("sms_opt_in"):
@@ -118,12 +129,19 @@ class MessagingAgent:
 
         states, violations = guardrails.check(record, d, message if d.should_send else None)
         if violations and d.should_send:
-            # last resort: deterministic template is always compliant
+            # last resort: the deterministic template (re-checked below; any violation is reported, never hidden)
             message, source, next_action = compose_template(record, d), "template(repair)", d.next_action
             message["body"] = guardrails.apply_brand_style(message["body"])
+            if message.get("subject"):
+                message["subject"] = guardrails.apply_brand_style(message["subject"])
             states, violations = guardrails.check(record, d, message)
 
         rationale = rationale or self._rationale(record, d)
+        return self._result(record, message, next_action, rationale, states, violations,
+                            reply_label, source, t0, trace)
+
+    @staticmethod
+    def _result(record, message, next_action, rationale, states, violations, reply_label, source, t0, trace):
         latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         return {
             "task_id": record.get("task_id"),
@@ -137,6 +155,33 @@ class MessagingAgent:
         }
 
     @staticmethod
+    def _reply_response(record: dict, d, label: str, reply: str):
+        prof = (record.get("input") or {}).get("profile") or {}
+        first = prof.get("first_name")
+        es = d.language == "es"
+        if label == "not_interested":
+            return None, {"type": "close_lead", "reason": "not_interested"}, \
+                "Contact said they are not interested; stop the cadence and send nothing more."
+        if label == "select_option" and d.cta_options:
+            idx = int(reply.strip()) - 1
+            day = d.cta_option_labels[idx] if 0 <= idx < len(d.cta_option_labels) else None
+        else:
+            day = None
+        hi = (f"Hola {first}" if first else "Hola") if es else (f"Hi {first}" if first else "Hi there")
+        if day:
+            body = (f"{hi}—¡perfecto! Te confirmaremos la hora de tu recorrido del {day} en breve." if es
+                    else f"{hi}—great choice! We’ll confirm your {day} tour time shortly.")
+            action = {"type": "confirm_tour", "day": day}
+        else:
+            body = (f"{hi}—¡gracias por tu mensaje! Un miembro de nuestro equipo te responderá en breve." if es
+                    else f"{hi}—thanks for your message! A member of our leasing team will follow up shortly.")
+            action = {"type": "handoff_to_leasing_agent", "reason": label}
+        body = guardrails.apply_brand_style(f"{body} {d.opt_out_text}")
+        msg = {"channel": d.channel, "send_at": "immediate", "subject": "Re: your message" if d.channel == "email" else None,
+               "body": body, "cta": {"type": action["type"]}}
+        return msg, action, f"Inbound reply classified as {label}; acknowledge it and {action['type'].replace('_', ' ')}."
+
+    @staticmethod
     def _enforce(msg: dict | None, d) -> dict | None:
         """Hard constraints win over the LLM."""
         if msg is None:
@@ -148,7 +193,7 @@ class MessagingAgent:
         if msg["channel"] == "sms":
             msg["subject"] = None
         body = msg.get("body") or ""
-        if d.opt_out_text and d.opt_out_text.lower() not in body.lower() and "stop" not in body.lower():
+        if d.opt_out_text and not guardrails.OPT_OUT_RE.search(body):
             msg["body"] = body.rstrip() + ("\n" if msg["channel"] == "email" else " ") + d.opt_out_text
         if msg["channel"] in ("sms", "voice"):
             msg["body"] = " ".join(msg["body"].split())  # single line
@@ -175,6 +220,6 @@ class MessagingAgent:
         bits = [f"{d.channel.upper()} is the first channel in the contact's preferences with explicit consent",
                 f"sent {d.send_at} local business hours"]
         if prof.get("amenity_interest"):
-            bits.append(f"personalized to stated interests ({', '.join(prof['amenity_interest'])})")
+            bits.append(f"personalized to stated interests ({', '.join(map(str, prof['amenity_interest']))})")
         bits.append(f"primary CTA {d.cta_type}; {d.horizon}-horizon move -> {json.dumps(d.next_action)}")
         return "; ".join(bits) + "."
