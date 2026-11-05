@@ -1,0 +1,42 @@
+{"text": "STOP", "label": "opt_out"}
+{"text": "stop", "label": "opt_out"}
+{"text": "Please stop texting me", "label": "opt_out"}
+{"text": "unsubscribe", "label": "opt_out"}
+{"text": "Remove me from this list", "label": "opt_out"}
+{"text": "don't contact me again", "label": "opt_out"}
+{"text": "Opt out", "label": "opt_out"}
+{"text": "1", "label": "select_option"}
+{"text": "2", "label": "select_option"}
+{"text": " 1 ", "label": "select_option"}
+{"text": "2!", "label": "select_option"}
+{"text": "Can I tour on Saturday?", "label": "schedule_tour"}
+{"text": "I'd like to come see the place", "label": "schedule_tour"}
+{"text": "Yes please book me a tour", "label": "schedule_tour"}
+{"text": "Can I stop by tomorrow afternoon to visit?", "label": "schedule_tour"}
+{"text": "Want to schedule a visit next week", "label": "schedule_tour"}
+{"text": "I need to reschedule my tour", "label": "reschedule"}
+{"text": "Can we do a different day?", "label": "reschedule"}
+{"text": "Something came up, can't make it Thursday", "label": "reschedule"}
+{"text": "Could we move it to another time", "label": "reschedule"}
+{"text": "Not interested", "label": "not_interested"}
+{"text": "No thanks, found another place", "label": "not_interested"}
+{"text": "We signed elsewhere, thanks", "label": "not_interested"}
+{"text": "no thanks", "label": "not_interested"}
+{"text": "How much is rent for a 2 bedroom?", "label": "pricing_question"}
+{"text": "What are the fees?", "label": "pricing_question"}
+{"text": "Is there a deposit", "label": "pricing_question"}
+{"text": "Any move-in specials right now?", "label": "pricing_question"}
+{"text": "What's the price range", "label": "pricing_question"}
+{"text": "Do you have any 1 bedroom units available in February?", "label": "availability_question"}
+{"text": "Which floor plans are open?", "label": "availability_question"}
+{"text": "Is the 3 bed still available", "label": "availability_question"}
+{"text": "What's your availability for a studio", "label": "availability_question"}
+{"text": "Do you allow dogs?", "label": "question"}
+{"text": "Is parking included?", "label": "question"}
+{"text": "What are your office hours?", "label": "question"}
+{"text": "Is there in-unit laundry?", "label": "question"}
+{"text": "Thanks!", "label": "other"}
+{"text": "ok", "label": "other"}
+{"text": "Who is this?", "label": "question"}
+{"text": "Sounds good", "label": "other"}
+{"text": "Yes", "label": "other"}

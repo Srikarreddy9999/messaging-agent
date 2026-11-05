@@ -35,30 +35,50 @@ def test_guardrails_catch_violations():
 
 
 class FakeLLM:
-    """Returns a non-compliant draft first, compliant second: exercises enforce + repair."""
+    """First draft breaks hard limits (voice has no consent, 2am send, bad action type, steering copy);
+    second draft is a valid email choice. Exercises per-field acceptance + repair."""
     def __init__(self):
         self.calls = 0
 
     def compose(self, record, d, shots, feedback=None):
         self.calls += 1
-        body = ("Great for families! See you soon." if self.calls == 1
-                else "Hi Taylor—welcome to Oak Ridge! Book a tour Thu or Fri? Reply 1 for Thu, 2 for Fri. Reply STOP to opt out.")
-        return {"next_message": {"channel": "email", "send_at": "garbage", "subject": "hi", "body": body,
-                                 "cta": {"type": "x", "options": ["Thu", "Fri"]}},
-                "next_action": {"type": "start_cadence", "name": "prospect_welcome_short_horizon"},
-                "rationale": "test"}
+        if self.calls == 1:
+            return {"next_message": {"channel": "voice", "send_at": "2025-12-09T02:00:00-06:00", "subject": None,
+                                     "body": "Great for families! See you soon.", "cta": {"type": "x"}},
+                    "next_action": {"type": "spam_them"}, "rationale": "bad"}
+        return {"next_message": {"channel": "email", "send_at": "2025-12-10T11:30:00-06:00", "subject": "Tour Oak Ridge",
+                                 "body": "Hi Taylor,\nBook a tour this week → https://oakridge.example/tour\nTo opt out of emails, click here or reply STOP.",
+                                 "cta": {"type": "x"}},
+                "next_action": {"type": "follow_up_in_days", "value": 2}, "rationale": "good"}
 
 
-def test_llm_output_is_enforced_and_repaired():
+def test_llm_decisions_accepted_within_hard_limits():
     agent = MessagingAgent(examples=SAMPLE)
     agent.llm = FakeLLM()
     out = agent.run(SAMPLE[0])
     m = out["next_message"]
     assert agent.llm.calls == 2
-    assert m["channel"] == "sms" and m["subject"] is None          # sms first consented preference
-    assert m["send_at"] == "2025-12-09T09:00:00-06:00"              # policy time wins
-    assert m["cta"]["type"] == "schedule_tour"
+    assert m["channel"] == "email" and m["send_at"] == "2025-12-10T11:30:00-06:00"   # LLM's consented choice
+    assert m["cta"] == {"type": "schedule_tour", "link": "https://oakridge.example/tour"}
+    assert out["next_action"] == {"type": "follow_up_in_days", "value": 2}
+    assert out["meta"]["decided_by"] == {"channel": "llm", "send_at": "llm", "next_action": "llm"}
+    trace = " ".join(out["meta"]["trace"])
+    assert "lacks consent" in trace and "outside quiet hours" in trace and "spam_them" in trace
     assert out["violations"] == []
+
+
+def test_fail_safe_when_everything_fails(monkeypatch=None):
+    import agent.agent as A
+    original = A.compose_template
+    A.compose_template = lambda r, d: {"channel": d.channel, "send_at": d.send_at, "subject": None,
+                                       "body": "Perfect for families!", "cta": {}}
+    try:
+        out = MessagingAgent(examples=SAMPLE).run(SAMPLE[0])
+    finally:
+        A.compose_template = original
+    assert out["next_message"] is None
+    assert out["next_action"] == {"type": "manual_review", "reason": "failed_validation"}
+    assert out["meta"]["source"] == "blocked" and out["meta"]["blocked_violations"]
 
 
 def test_guardrails_catch_copied_example_details():

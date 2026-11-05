@@ -8,7 +8,11 @@ import json
 import os
 from datetime import date
 
-from .policy import Decision, short_property_name
+from .policy import OPT_OUT_TEXT, Decision, short_property_name
+
+
+def OPT_OUT_TEXT_FOR(lang: str, channel: str) -> str:
+    return OPT_OUT_TEXT.get(lang, OPT_OUT_TEXT["en"])[channel]
 
 MONTHS_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
              "septiembre", "octubre", "noviembre", "diciembre"]
@@ -121,10 +125,15 @@ You learn the house style and decision patterns ONLY from the worked examples pr
 Mirror their structure closely: greeting with first name, em dashes, short sentences, a single clear CTA,
 opt-out line last. SMS has no subject and uses numbered reply options; email has a subject and a link CTA.
 
-A deterministic policy engine has already computed the hard constraints (consented channels, send time,
-opt-out wording, CTA options/link). Treat them as authoritative unless an example clearly shows a different
-pattern for this exact situation. Never:
-- use a channel without consent
+You make the workflow decisions too: whether to send, which channel, when (send_at with UTC offset),
+and the next_action. Base them on the patterns in the examples. The input also gives you:
+- hard_limits: rules you must never break (consented channels, quiet hours, opt-out text per channel).
+  Anything that breaks them is rejected and replaced.
+- defaults: what the agent would do without you. They are assumptions, not learned rules. Use them only
+  when the examples don't show a clearer pattern for this situation.
+- cta_by_channel: the reply options or link to use for whichever channel you choose.
+Never:
+- use a channel without consent or send outside quiet hours
 - mention or allude to protected characteristics (race, color, religion, sex, national origin,
   familial status/children, disability, age) or describe who a property is "ideal for"
 - include personal data beyond the first name and stated interests (no email/phone/address/last name)
@@ -194,17 +203,32 @@ def build_user_prompt(record: dict, d: Decision, examples: list[dict], feedback:
         f"<expected>{json.dumps(e['expected'], ensure_ascii=False)}</expected>\n</example>"
         for e in examples
     )
+    from .policy import ASSUMPTIONS, QUIET_END, QUIET_START, with_channel_and_time
+    inp = record.get("input") or {}
+    hard_limits = {
+        "eligible_channels": d.eligible_channels,
+        "quiet_hours_local": f"{QUIET_START:02d}:00-{QUIET_END:02d}:00 {getattr(d.tz, 'key', d.tz)}",
+        "send_after": d.last_local.isoformat() if d.last_local else None,
+        "opt_out_text_by_channel": {c: OPT_OUT_TEXT_FOR(d.language, c) for c in d.eligible_channels},
+        "language": d.language,
+    }
+    defaults = {"channel": d.channel, "send_at": d.send_at, "next_action": d.next_action, "horizon": d.horizon,
+                "basis": {k: v["basis"] for k, v in ASSUMPTIONS.items()}}
+    cta_by_channel = {}
+    if d.send_at:
+        from datetime import datetime as _dt
+        for c in d.eligible_channels:
+            dc = with_channel_and_time(d, record, c, _dt.fromisoformat(d.send_at))
+            cta_by_channel[c] = {"type": dc.cta_type, "options": dc.cta_options or None,
+                                 "option_labels": dc.cta_option_labels or None, "link": dc.cta_link,
+                                 "tour_days_are_this_week": dc.cta_same_week}
     policy = {
-        "should_send": d.should_send, "channel": d.channel, "eligible_channels": d.eligible_channels,
-        "send_at": d.send_at, "language": d.language, "opt_out_text": d.opt_out_text,
-        "cta": {"type": d.cta_type, "options": d.cta_options or None, "option_labels": d.cta_option_labels or None,
-                "link": d.cta_link, "tour_days_are_this_week": d.cta_same_week},
-        "horizon": d.horizon, "suggested_next_action": d.next_action, "suppress_reason": d.suppress_reason,
-        "move_timing": _move_phrase((record.get("input") or {}).get("move_date_target")),
-        "first_name": ((record.get("input") or {}).get("profile") or {}).get("first_name"),
+        "hard_limits": hard_limits, "defaults": defaults, "cta_by_channel": cta_by_channel,
+        "move_timing": _move_phrase(inp.get("move_date_target")),
+        "first_name": (inp.get("profile") or {}).get("first_name"),
     }
     user = (f"<examples>\n{shots}\n</examples>\n\n"
-            f"<policy_engine_output>{json.dumps(policy, ensure_ascii=False)}</policy_engine_output>\n\n"
+            f"<decision_context>{json.dumps(policy, ensure_ascii=False)}</decision_context>\n\n"
             f"<record>{json.dumps(_without_expected(record), ensure_ascii=False)}</record>\n\n"
             f"Write the message in language '{d.language}'. Personalize with the first name and any stated "
             f"interests in the record (not the examples' names, days or interests). If first_name is null, "
@@ -226,21 +250,23 @@ class OllamaComposer:
         self.timeout = timeout
 
     def compose(self, record: dict, d: Decision, examples: list[dict], feedback: list[str] | None = None) -> dict:
+        return _strip_nulls(self.json_call(SYSTEM_PROMPT, build_user_prompt(record, d, examples, feedback), OUTPUT_SCHEMA))
+
+    def json_call(self, system: str, user: str, schema: dict) -> dict:
         import urllib.request
 
         payload = {
             "model": self.model,
             "stream": False,
-            "format": OUTPUT_SCHEMA,
+            "format": schema,
             "options": {"temperature": 0, "num_ctx": 8192},
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                         {"role": "user", "content": build_user_prompt(record, d, examples, feedback)}],
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         }
         req = urllib.request.Request(f"{self.host}/api/chat", data=json.dumps(payload).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             data = json.loads(resp.read())
-        return _strip_nulls(json.loads(data["message"]["content"]))
+        return json.loads(data["message"]["content"])
 
 
 class OpenAIComposer:
@@ -254,12 +280,14 @@ class OpenAIComposer:
         self.model = model or os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 
     def compose(self, record: dict, d: Decision, examples: list[dict], feedback: list[str] | None = None) -> dict:
+        return _strip_nulls(self.json_call(SYSTEM_PROMPT, build_user_prompt(record, d, examples, feedback), OUTPUT_SCHEMA))
+
+    def json_call(self, system: str, user: str, schema: dict) -> dict:
         kwargs = dict(
             model=self.model,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                      {"role": "user", "content": build_user_prompt(record, d, examples, feedback)}],
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_schema",
-                             "json_schema": {"name": "next_step", "strict": True, "schema": OUTPUT_SCHEMA}},
+                             "json_schema": {"name": "result", "strict": True, "schema": schema}},
             max_completion_tokens=4000,
         )
         if self.model.startswith(("gpt-5", "o")):
@@ -272,7 +300,7 @@ class OpenAIComposer:
             raise RuntimeError(f"model refused: {choice.message.refusal}")
         if choice.finish_reason == "length":
             raise RuntimeError("model output truncated (length)")
-        return _strip_nulls(json.loads(choice.message.content))
+        return json.loads(choice.message.content)
 
 
 class ClaudeComposer:
@@ -285,14 +313,15 @@ class ClaudeComposer:
         self.effort = effort
 
     def compose(self, record: dict, d: Decision, examples: list[dict], feedback: list[str] | None = None) -> dict:
-        user = build_user_prompt(record, d, examples, feedback)
+        return _strip_nulls(self.json_call(SYSTEM_PROMPT, build_user_prompt(record, d, examples, feedback), OUTPUT_SCHEMA))
+
+    def json_call(self, system: str, user: str, schema: dict) -> dict:
         kwargs = dict(
             model=self.model,
             max_tokens=4000,
-            system=SYSTEM_PROMPT,
+            system=system,
             messages=[{"role": "user", "content": user}],
-            output_config={"effort": self.effort,
-                           "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
+            output_config={"effort": self.effort, "format": {"type": "json_schema", "schema": schema}},
         )
         if self.model in {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5"}:
             # Server-side refusal fallback: on a safety decline the API retries on a fallback model.
@@ -305,5 +334,4 @@ class ClaudeComposer:
         if resp.stop_reason == "max_tokens":
             raise RuntimeError("model output truncated (max_tokens)")
         text = next(b.text for b in resp.content if b.type == "text")
-        out = json.loads(text)
-        return _strip_nulls(out)
+        return json.loads(text)

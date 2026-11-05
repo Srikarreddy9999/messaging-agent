@@ -1,9 +1,14 @@
-"""Deterministic decision layer.
+"""Decision layer: hard limits + labelled default assumptions.
 
-Everything here is a hard rule that must hold regardless of what an LLM says:
-consent, channel eligibility, quiet hours, opt-out wording, send-time math.
-These are the parts of the problem where "semantically close" is not good
-enough (a message on a non-consented channel is a compliance violation).
+Two kinds of rules live here, and they are kept apart on purpose:
+
+* HARD LIMITS (never overridden): consent per channel, opt-out / do-not-contact,
+  terminal lifecycle stages, quiet hours, opt-out wording.
+* DEFAULTS (overridable): channel order, send time, horizon, next action. These
+  come from ASSUMPTIONS below. They are NOT learned rules: with an LLM enabled,
+  the LLM proposes these decisions from the few-shot examples and the agent
+  only falls back to these defaults when a proposal breaks a hard limit or is
+  malformed. Every default that is used is named in the output trace.
 """
 from __future__ import annotations
 
@@ -14,10 +19,21 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CHANNEL_CONSENT_KEY = {"sms": "sms_opt_in", "email": "email_opt_in", "voice": "voice_opt_in"}
 
-# Local send hour per channel, learned from the sample data (sms 09:00, email 10:00).
-# Voice is not in the samples; 11:00 keeps it inside business hours.
-SEND_HOUR = {"sms": 9, "email": 10, "voice": 11}
-QUIET_START, QUIET_END = 8, 21  # TCPA-style window, local time
+# Every number the agent uses that is not given in the record, with its honest basis.
+# Two samples cannot establish any of these as rules.
+ASSUMPTIONS = {
+    "send_hour_local": {"value": {"sms": 9, "email": 10, "voice": 11},
+                        "basis": "sms 09:00 and email 10:00 match the two samples (n=1 each); voice is a guess"},
+    "send_day_offset": {"value": 1,
+                        "basis": "next day; sample 1 (day0) was sent next day"},
+    "task_id_day_hint": {"value": True,
+                         "basis": "task_id 'dayN' matched send offset in both samples; a naming coincidence is possible"},
+    "short_horizon_days": {"value": 45, "basis": "guess between the samples' 33 and 71 days"},
+    "follow_up_days": {"value": 3, "basis": "one sample"},
+    "max_send_delay_days": {"value": 14, "basis": "sanity bound on LLM-proposed send times; guess"},
+}
+SEND_HOUR = ASSUMPTIONS["send_hour_local"]["value"]
+QUIET_START, QUIET_END = 8, 21  # HARD LIMIT: TCPA-style window, local time
 
 OPT_OUT_TEXT = {
     "en": {
@@ -39,7 +55,7 @@ CTA_PATH = {"apply_now": "apply", "apply": "apply", "renew_lease": "renew", "ren
 
 TERMINAL_STAGES = {"lost", "closed", "closed_lost", "do_not_contact", "unsubscribed", "dead", "archived"}
 
-SHORT_HORIZON_DAYS = 45  # move date within ~6 weeks => short horizon cadence
+SHORT_HORIZON_DAYS = ASSUMPTIONS["short_horizon_days"]["value"]
 
 STOP_WORDS = {"stop", "unsubscribe", "cancel", "end", "quit", "stopall", "opt out", "optout", "remove me"}
 
@@ -58,6 +74,9 @@ class Decision:
     cta_link: str | None = None
     cta_same_week: bool = True
     horizon: str = "unknown"  # short | long | unknown
+    tz: object = None
+    last_local: datetime | None = None
+    defaults_used: list[str] = field(default_factory=list)
     next_action: dict = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
     suppress_reason: str | None = None
@@ -204,28 +223,33 @@ def decide(record: dict, now: datetime | None = None) -> Decision:
         )
 
     channel = eligible[0]
-    reasons.append(f"channel={channel} (first consented preference)")
+    defaults_used = ["channel: first consented preference"]
+    reasons.append(f"default channel={channel} (first consented preference)")
 
-    # --- timing -----------------------------------------------------------
+    # --- timing (default) ---------------------------------------------------
     last = _parse_ts(inp.get("last_interaction"), tz) or (now or datetime.now(timezone.utc))
     last_local = last.astimezone(tz)
-    offset = day_offset_from_task(record.get("task_id", ""))
-    offset = max(1, offset) if offset is not None else 1
+    offset = day_offset_from_task(record.get("task_id", "")) if ASSUMPTIONS["task_id_day_hint"]["value"] else None
+    if offset is not None:
+        offset = max(1, offset)
+        defaults_used.append("send day: task_id dayN hint (assumption task_id_day_hint)")
+    else:
+        offset = ASSUMPTIONS["send_day_offset"]["value"]
+        defaults_used.append("send day: next day (assumption send_day_offset)")
     send_day = last_local.date() + timedelta(days=offset)
     hour = min(max(SEND_HOUR.get(channel, 10), QUIET_START), QUIET_END - 1)
+    defaults_used.append(f"send hour {hour}:00 (assumption send_hour_local)")
     send_dt = datetime(send_day.year, send_day.month, send_day.day, hour, 0, tzinfo=tz)
     if now and send_dt <= now:
         send_dt = send_dt + timedelta(days=(now.astimezone(tz).date() - send_day).days + 1)
     send_at = send_dt.isoformat()
-    reasons.append(f"send_at={send_at} (last_interaction + {offset}d at {hour}:00 local, inside quiet-hours window)")
+    reasons.append(f"default send_at={send_at} (last_interaction + {offset}d at {hour}:00 local)")
 
-    # --- horizon & cadence -------------------------------------------------
+    # --- horizon & cadence (default) ------------------------------------------
     move = _parse_date(inp.get("move_date_target"))
     tid = str(record.get("task_id") or "").lower()
-    if "short" in tid:
-        horizon = "short"
-    elif "long" in tid:
-        horizon = "long"
+    if ASSUMPTIONS["task_id_day_hint"]["value"] and ("short" in tid or "long" in tid):
+        horizon = "short" if "short" in tid else "long"
     elif move and move < last_local.date():
         horizon = "unknown"  # stale move date: don't claim they're "planning a move"
     elif move:
@@ -237,30 +261,96 @@ def decide(record: dict, now: datetime | None = None) -> Decision:
     if stage == "new":
         next_action = {"type": "start_cadence", "name": f"{persona}_welcome_{horizon if horizon != 'unknown' else 'short'}_horizon"}
     else:
-        next_action = {"type": "follow_up_in_days", "value": 3}
-    reasons.append(f"horizon={horizon} (move date {move}), stage={stage} -> next_action={next_action}")
+        next_action = {"type": "follow_up_in_days", "value": ASSUMPTIONS["follow_up_days"]["value"]}
+    defaults_used.append(f"next_action {next_action['type']} (assumptions short_horizon_days / follow_up_days)")
+    reasons.append(f"default horizon={horizon} (move date {move}), stage={stage} -> next_action={next_action}")
 
-    # --- CTA ----------------------------------------------------------------
-    options, labels, link, same_week = [], [], None, True
-    if cta_type == "schedule_tour":
-        if channel == "sms":
-            # two weekdays at least 2 days after the send day -> numbered reply options
-            d = send_day + timedelta(days=2)
-            days_es = ["lunes", "martes", "miércoles", "jueves", "viernes"]
-            while len(options) < 2:
-                if d.weekday() < 5:
-                    options.append(d.strftime("%a"))
-                    labels.append(days_es[d.weekday()] if lang_key == "es" else d.strftime("%A"))
-                    same_week = same_week and d.isocalendar()[1] == send_day.isocalendar()[1]
-                d += timedelta(days=1)
-        else:
-            link = property_link(inp.get("property_name"), "tour")
-    elif cta_type and channel == "email":
-        link = property_link(inp.get("property_name"), CTA_PATH.get(cta_type, re.sub(r"[^a-z0-9]+", "-", str(cta_type).lower())))
-
-    return Decision(
+    d = Decision(
         should_send=True, channel=channel, eligible_channels=eligible, send_at=send_at,
         language=lang_key, opt_out_text=OPT_OUT_TEXT[lang_key][channel], cta_type=cta_type,
-        cta_options=options, cta_option_labels=labels, cta_link=link, cta_same_week=same_week, horizon=horizon,
-        next_action=next_action, reasons=reasons,
+        horizon=horizon, next_action=next_action, reasons=reasons,
+        tz=tz, last_local=last_local, defaults_used=defaults_used,
     )
+    return with_channel_and_time(d, record, channel, send_dt)
+
+
+def with_channel_and_time(d: Decision, record: dict, channel: str, send_dt: datetime) -> Decision:
+    """Recompute everything that depends on channel and send time (opt-out text, CTA options/link)."""
+    from dataclasses import replace
+    inp = record.get("input") or {}
+    send_day = send_dt.date()
+    options, labels, link, same_week = [], [], None, True
+    if d.cta_type == "schedule_tour":
+        if channel == "sms":
+            # two weekdays at least 2 days after the send day -> numbered reply options (sample 1 pattern)
+            day = send_day + timedelta(days=2)
+            days_es = ["lunes", "martes", "miércoles", "jueves", "viernes"]
+            while len(options) < 2:
+                if day.weekday() < 5:
+                    options.append(day.strftime("%a"))
+                    labels.append(days_es[day.weekday()] if d.language == "es" else day.strftime("%A"))
+                    same_week = same_week and day.isocalendar()[1] == send_day.isocalendar()[1]
+                day += timedelta(days=1)
+        else:
+            link = property_link(inp.get("property_name"), "tour")
+    elif d.cta_type and channel == "email":
+        link = property_link(inp.get("property_name"),
+                             CTA_PATH.get(d.cta_type, re.sub(r"[^a-z0-9]+", "-", str(d.cta_type).lower())))
+    return replace(d, channel=channel, send_at=send_dt.isoformat(), opt_out_text=OPT_OUT_TEXT[d.language][channel],
+                   cta_options=options, cta_option_labels=labels, cta_link=link, cta_same_week=same_week)
+
+
+# ---------------------------------------------------------------------------
+# Validators for LLM-proposed workflow decisions (hard limits only)
+# ---------------------------------------------------------------------------
+def check_send_at(value, d: Decision) -> tuple[datetime | None, str | None]:
+    """Accept an LLM send time only if it is a real timestamp with an offset, inside quiet hours in the
+    contact's timezone, after the last interaction and within a sane delay. Returns (datetime, problem)."""
+    if not isinstance(value, str):
+        return None, "send_at missing"
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None, f"send_at {value!r} is not ISO-8601"
+    if dt.tzinfo is None:
+        return None, "send_at has no UTC offset"
+    local = dt.astimezone(d.tz) if d.tz else dt
+    if not (QUIET_START <= local.hour < QUIET_END):
+        return None, f"send_at {local:%H:%M} local is outside quiet hours {QUIET_START}:00-{QUIET_END}:00"
+    if d.last_local and dt <= d.last_local:
+        return None, "send_at is not after last_interaction"
+    max_days = ASSUMPTIONS["max_send_delay_days"]["value"]
+    if d.last_local and (dt - d.last_local).days > max_days:
+        return None, f"send_at is more than {max_days} days after last_interaction"
+    return local, None
+
+
+ACTION_FIELDS = {"start_cadence": ("name",), "follow_up_in_days": ("value",), "suppress": ("reason",),
+                 "manual_review": ("reason",), "close_lead": ("reason",), "handoff_to_leasing_agent": ("reason",),
+                 "confirm_tour": ("day",), "opt_out": ("channel",)}
+
+
+def normalize_action(action: dict) -> dict:
+    """Keep only the fields each action type uses (the sample shape), dropping LLM padding."""
+    keep = ACTION_FIELDS.get(action["type"], ("name", "value", "reason"))
+    return {"type": action["type"], **{k: action[k] for k in keep if action.get(k) is not None}}
+
+
+ALLOWED_ACTION_TYPES = {"start_cadence", "follow_up_in_days", "suppress", "manual_review", "close_lead",
+                        "handoff_to_leasing_agent", "confirm_tour", "opt_out", "wait_for_reply", "schedule_call"}
+
+
+def check_next_action(action, example_types: set[str]) -> str | None:
+    """Shape check only. The type must be one the examples use or a known safe workflow action."""
+    if not isinstance(action, dict) or not isinstance(action.get("type"), str):
+        return "next_action missing a type"
+    t = action["type"]
+    if t not in ALLOWED_ACTION_TYPES | example_types:
+        return f"next_action type {t!r} is not in the examples or the known action set"
+    if t == "follow_up_in_days":
+        v = action.get("value")
+        if not isinstance(v, int) or not 1 <= v <= 30:
+            return "follow_up_in_days needs an integer value between 1 and 30"
+    if t == "start_cadence" and not (isinstance(action.get("name"), str) and re.fullmatch(r"[a-z0-9_]{3,80}", action["name"])):
+        return "start_cadence needs a snake_case name"
+    return None

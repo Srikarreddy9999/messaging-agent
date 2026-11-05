@@ -9,16 +9,17 @@ from datetime import datetime
 
 from . import guardrails
 from .composer import ClaudeComposer, OllamaComposer, OpenAIComposer, compose_template
-from .policy import decide, inbound_text, is_stop_request
+from .policy import normalize_action, check_next_action, check_send_at, decide, inbound_text, is_stop_request, with_channel_and_time
 
 # --------------------------------------------------------------------------
 # Reply classification (the thresholds mention reply_classification_f1)
 # --------------------------------------------------------------------------
 REPLY_RULES = [
     ("opt_out", r"^\s*(cancel|end|quit)\W*$"),
-    ("select_option", r"^\s*[1-9]\s*$"),
+    ("select_option", r"^\s*[1-9]\s*[.!]?\s*$"),
+    # reschedule before schedule_tour: "reschedule my tour" mentions a tour too
+    ("reschedule", r"\b(reschedule|another time|different (day|time)|can'?t make it|move it)\b"),
     ("schedule_tour", r"\b(tour|visit|see the (place|unit)|come by|book)\b"),
-    ("reschedule", r"\b(reschedule|another time|different (day|time)|can'?t make it)\b"),
     ("not_interested", r"\b(not interested|no thanks|found (a|another) place|signed elsewhere)\b"),
     ("pricing_question", r"\b(price|rent|cost|how much|fees?|deposit|specials?)\b"),
     ("availability_question", r"\b(available|availability|units?|floor ?plans?|bedrooms?|\dbr|\d bed)\b"),
@@ -63,12 +64,18 @@ def select_examples(record: dict, pool: list[dict], k: int = 4) -> list[dict]:
 # --------------------------------------------------------------------------
 class MessagingAgent:
     def __init__(self, examples: list[dict] | None = None, llm: str | None = None,
-                 model: str | None = None, max_repairs: int = 1, now: datetime | None = None):
+                 model: str | None = None, max_repairs: int = 1, now: datetime | None = None,
+                 decisions: str = "llm"):
         """llm: None (offline templates) | "ollama" (free, local) | "openai" | "claude"."""
         self.examples = examples or []
         self.llm = {"ollama": OllamaComposer, "openai": OpenAIComposer, "claude": ClaudeComposer}[llm](model=model) if llm else None
         self.max_repairs = max_repairs
         self.now = now
+        # "llm": the LLM's channel / send time / next action are used when they pass the hard limits.
+        # "rules": the LLM only writes copy; workflow decisions come from the labelled defaults.
+        self.decisions = decisions
+        self.example_action_types = {((e.get("expected") or {}).get("next_action") or {}).get("type")
+                                     for e in self.examples} - {None}
 
     def run(self, record: dict) -> dict:
         t0 = time.perf_counter()
@@ -101,6 +108,8 @@ class MessagingAgent:
             rationale = f"Not sending marketing: {d.suppress_reason}."
         else:
             violations: list[str] = []
+            d_eff = d
+            decided_by = {"channel": "default", "send_at": "default", "next_action": "default"}
             if self.llm:
                 shots = select_examples(record, self.examples)
                 feedback = None
@@ -110,38 +119,51 @@ class MessagingAgent:
                     except Exception as e:  # network/refusal/parse -> fall back to template
                         trace.append(f"llm error: {e!r}; falling back to template")
                         break
-                    message = self._enforce(out.get("next_message"), d)
-                    # next_action is a workflow decision: policy owns it; the LLM's proposal is only logged.
-                    if out.get("next_action") and out["next_action"] != d.next_action:
-                        trace.append(f"llm proposed next_action {out['next_action']}; kept policy {d.next_action}")
-                    rationale, source = out.get("rationale"), f"llm(attempt {attempt + 1})"
-                    _, violations = guardrails.check(record, d, message)
+                    source, rationale = f"llm(attempt {attempt + 1})", out.get("rationale")
+                    message, next_action, d_eff, decided_by = self._accept(out, d, record, trace)
+                    if message is None:  # the LLM chose not to send; that is always the safe direction
+                        trace.append(f"llm chose not to send; next_action={next_action}")
+                        return self._result(record, None, next_action, rationale, [], [], reply_label, source,
+                                            t0, trace, decided_by)
+                    _, violations = guardrails.check(record, d_eff, message)
                     if not violations:
                         break
                     trace.append(f"guardrail violations: {violations}")
-                    feedback, message = violations, None
+                    feedback, message, d_eff = violations, None, d
             if message is None:
                 message, source = compose_template(record, d), "template"
-                next_action = d.next_action
+                next_action, d_eff = d.next_action, d
+                decided_by = {"channel": "default", "send_at": "default", "next_action": "default"}
             message["body"] = guardrails.apply_brand_style(message["body"])
             if message.get("subject"):
                 message["subject"] = guardrails.apply_brand_style(message["subject"])
+            states, violations = guardrails.check(record, d_eff, message)
+            if violations and source != "template":
+                trace.append(f"final draft failed: {violations}; trying template")
+                message, source, next_action, d_eff = compose_template(record, d), "template(repair)", d.next_action, d
+                decided_by = {"channel": "default", "send_at": "default", "next_action": "default"}
+                message["body"] = guardrails.apply_brand_style(message["body"])
+                if message.get("subject"):
+                    message["subject"] = guardrails.apply_brand_style(message["subject"])
+                states, violations = guardrails.check(record, d, message)
+            if violations:
+                # Fail safe: nothing that failed validation is ever sent.
+                trace.append(f"blocked: every draft failed validation ({violations}); routed to manual review")
+                return self._result(record, None, {"type": "manual_review", "reason": "failed_validation"},
+                                    "Every draft failed a compliance check, so nothing is sent and a person reviews it.",
+                                    [], [], reply_label, "blocked", t0, trace, decided_by, blocked=violations)
+            rationale = rationale or self._rationale(record, d)
+            return self._result(record, message, next_action, rationale, states, violations, reply_label,
+                                source, t0, trace, decided_by)
 
-        states, violations = guardrails.check(record, d, message if d.should_send else None)
-        if violations and d.should_send:
-            # last resort: the deterministic template (re-checked below; any violation is reported, never hidden)
-            message, source, next_action = compose_template(record, d), "template(repair)", d.next_action
-            message["body"] = guardrails.apply_brand_style(message["body"])
-            if message.get("subject"):
-                message["subject"] = guardrails.apply_brand_style(message["subject"])
-            states, violations = guardrails.check(record, d, message)
-
+        states, violations = guardrails.check(record, d, None)
         rationale = rationale or self._rationale(record, d)
         return self._result(record, message, next_action, rationale, states, violations,
                             reply_label, source, t0, trace)
 
     @staticmethod
-    def _result(record, message, next_action, rationale, states, violations, reply_label, source, t0, trace):
+    def _result(record, message, next_action, rationale, states, violations, reply_label, source, t0, trace,
+                decided_by=None, blocked=None):
         latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         return {
             "task_id": record.get("task_id"),
@@ -151,7 +173,8 @@ class MessagingAgent:
             "states": states,
             "violations": violations,
             "reply_classification": reply_label,
-            "meta": {"source": source, "latency_ms": latency_ms, "trace": trace},
+            "meta": {"source": source, "decided_by": decided_by or {}, "latency_ms": latency_ms,
+                     **({"blocked_violations": blocked} if blocked else {}), "trace": trace},
         }
 
     @staticmethod
@@ -163,7 +186,7 @@ class MessagingAgent:
             return None, {"type": "close_lead", "reason": "not_interested"}, \
                 "Contact said they are not interested; stop the cadence and send nothing more."
         if label == "select_option" and d.cta_options:
-            idx = int(reply.strip()) - 1
+            idx = int(re.sub(r"\D", "", reply)) - 1
             day = d.cta_option_labels[idx] if 0 <= idx < len(d.cta_option_labels) else None
         else:
             day = None
@@ -181,36 +204,63 @@ class MessagingAgent:
                "body": body, "cta": {"type": action["type"]}}
         return msg, action, f"Inbound reply classified as {label}; acknowledge it and {action['type'].replace('_', ' ')}."
 
-    @staticmethod
-    def _enforce(msg: dict | None, d) -> dict | None:
-        """Hard constraints win over the LLM."""
+    def _accept(self, out: dict, d, record: dict, trace: list[str]):
+        """Take the LLM's workflow decisions where they respect the hard limits; fall back per field otherwise."""
+        if self.decisions == "rules":
+            out = {**out, "next_action": d.next_action}
+            if out.get("next_message"):
+                out["next_message"] = {**out["next_message"], "channel": d.channel, "send_at": d.send_at}
+        decided_by = {}
+        action = out.get("next_action")
+        problem = check_next_action(action, self.example_action_types)
+        if problem:
+            trace.append(f"llm next_action rejected ({problem}); using default {d.next_action}")
+            action, decided_by["next_action"] = d.next_action, "default"
+        else:
+            action, decided_by["next_action"] = normalize_action(action), "llm"
+        msg = out.get("next_message")
         if msg is None:
-            return None
+            if decided_by["next_action"] == "default" or action.get("type") == "start_cadence":
+                action = {"type": "manual_review", "reason": "llm_declined_to_send"}
+            return None, action, d, decided_by
         msg = dict(msg)
-        # Channel is a policy decision (first consented preference), not a copywriting one.
-        msg["channel"] = d.channel
-        msg["send_at"] = d.send_at
-        if msg["channel"] == "sms":
+
+        channel = msg.get("channel")
+        if channel in d.eligible_channels:
+            decided_by["channel"] = "llm"
+        else:
+            trace.append(f"llm channel {channel!r} lacks consent; using default {d.channel}")
+            channel, decided_by["channel"] = d.channel, "default"
+        when, problem = check_send_at(msg.get("send_at"), d)
+        if problem:
+            trace.append(f"llm send_at rejected ({problem}); using default {d.send_at}")
+            when, decided_by["send_at"] = datetime.fromisoformat(d.send_at), "default"
+        else:
+            decided_by["send_at"] = "llm"
+        d_eff = with_channel_and_time(d, record, channel, when)
+        if decided_by["channel"] == "llm" and channel != d.channel:
+            trace.append(f"llm chose channel {channel} over default {d.channel}")
+
+        msg["channel"], msg["send_at"] = channel, d_eff.send_at
+        if channel in ("sms", "voice"):
             msg["subject"] = None
         body = msg.get("body") or ""
-        if d.opt_out_text and not guardrails.OPT_OUT_RE.search(body):
-            msg["body"] = body.rstrip() + ("\n" if msg["channel"] == "email" else " ") + d.opt_out_text
-        if msg["channel"] in ("sms", "voice"):
-            msg["body"] = " ".join(msg["body"].split())  # single line
-        msg["body"] = guardrails.apply_brand_style(msg["body"])
+        if d_eff.opt_out_text and not guardrails.OPT_OUT_RE.search(body):
+            body = body.rstrip() + ("\n" if channel == "email" else " ") + d_eff.opt_out_text
+        if channel in ("sms", "voice"):
+            body = " ".join(body.split())  # single line
+        msg["body"] = guardrails.apply_brand_style(body)
         if msg.get("subject"):
             msg["subject"] = guardrails.apply_brand_style(msg["subject"])
-        cta = msg.get("cta") or {}
-        if d.cta_type:
-            cta["type"] = d.cta_type
-        if d.cta_options:
-            cta["options"] = list(d.cta_options)
-            cta.pop("link", None)
-        if d.cta_link:
-            cta["link"] = d.cta_link
-            cta.pop("options", None)
+        cta = {k: v for k, v in (msg.get("cta") or {}).items() if k not in ("options", "link")}
+        if d_eff.cta_type:
+            cta["type"] = d_eff.cta_type
+        if d_eff.cta_options:
+            cta["options"] = list(d_eff.cta_options)
+        if d_eff.cta_link:
+            cta["link"] = d_eff.cta_link
         msg["cta"] = cta
-        return msg
+        return msg, action, d_eff, decided_by
 
     @staticmethod
     def _rationale(record: dict, d) -> str:
