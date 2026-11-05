@@ -27,7 +27,7 @@ from agent.evaluate import score  # noqa: E402
 
 def load_jsonl(path: str) -> list[dict]:
     rows = []
-    for i, line in enumerate(Path(path).read_text().splitlines(), 1):
+    for i, line in enumerate(Path(path).read_text(encoding="utf-8-sig").splitlines(), 1):
         line = line.strip()
         if not line:
             continue
@@ -39,6 +39,10 @@ def load_jsonl(path: str) -> list[dict]:
 
 
 def main() -> None:
+    # Windows consoles default to cp1252; message copy has em dashes and curly quotes.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
     ap.add_argument("input", help="JSONL of test cases")
     ap.add_argument("--examples", default=None, help="training JSONL for few-shot (default: the input file itself, leave-one-out)")
@@ -55,7 +59,7 @@ def main() -> None:
 
     outputs, scores = [], []
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.out, "w") as f:
+    with open(args.out, "w", encoding="utf-8") as f:
         for r in records:
             # One bad record must never cost the other outputs.
             try:

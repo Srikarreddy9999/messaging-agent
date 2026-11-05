@@ -9,7 +9,7 @@ from agent.agent import MessagingAgent, classify_reply  # noqa: E402
 from agent.policy import decide  # noqa: E402
 
 DATA = Path(__file__).resolve().parents[1] / "data"
-SAMPLE = [json.loads(l) for l in (DATA / "sample.jsonl").read_text().splitlines() if l.strip()]
+SAMPLE = [json.loads(l) for l in (DATA / "sample.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
 
 
 def test_samples_match_expected_structure():

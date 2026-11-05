@@ -93,7 +93,7 @@ def _parse_date(value) -> date | None:
         return None
 
 
-def safe_tz(name) -> ZoneInfo:
+def safe_tz(name):
     """IANA name, or common abbreviations; never raises."""
     alias = {"CST": "America/Chicago", "CDT": "America/Chicago", "CT": "America/Chicago",
              "EST": "America/New_York", "EDT": "America/New_York", "ET": "America/New_York",
@@ -105,9 +105,10 @@ def safe_tz(name) -> ZoneInfo:
         try:
             if candidate:
                 return ZoneInfo(candidate)
-        except (ZoneInfoNotFoundError, ValueError):
+        except (ZoneInfoNotFoundError, ValueError, OSError):
             continue
-    return ZoneInfo("America/Chicago")
+    # No IANA database at all (Windows without the tzdata package): fixed US Central offset.
+    return timezone(timedelta(hours=-6), "CST")
 
 
 def short_property_name(name: str | None) -> str:
