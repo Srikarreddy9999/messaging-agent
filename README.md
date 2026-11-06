@@ -28,8 +28,10 @@ Don't run `agent\agent.py` directly: it's a package module, so that gives "attem
 py -m venv .venv; .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\python run.py data\sample.jsonl
 $env:OPENAI_API_KEY = "sk-..."   # current terminal only
-.venv\Scripts\python run.py data\holdout.jsonl --llm openai --examples data\sample.jsonl --out outputs\holdout.jsonl
+.venv\Scripts\python run.py data\holdout.jsonl --llm openai --decisions rules --examples data\sample.jsonl --out outputs\holdout.jsonl
 ```
+
+Use `--decisions rules` for the hold-out. With only two examples, the LLM picks channel and time less reliably than the defaults (see "What was measured").
 
 A ChatGPT subscription does not include API access. The API is billed separately and prepaid; a few dollars
 of credit covers this many times over.
@@ -89,6 +91,20 @@ Two examples can't establish any of these. They live in `ASSUMPTIONS` in `agent/
 
 With `--decisions llm`, the LLM can depart from these whenever the examples show a different pattern, as long as it stays inside the hard limits.
 
+## Edge cases
+
+`data/edge_cases.jsonl` has 34 records, and `test_edge_cases_file` asserts the expected behaviour for each one:
+
+| Area | Cases | Expected behaviour |
+|---|---|---|
+| Suppression | no consent, `do_not_contact`, `closed_lost`, consent given as strings ("yes"), empty record | `next_message: null`, with the reason |
+| Replies | STOP, Spanish "cancelar", "not interested", "1", reschedule, general question, "can I stop by" | opt-out confirmation, `close_lead`, `confirm_tour`, or a handoff to an agent. "Stop by" is **not** an opt-out |
+| Timing | late-night last contact, Thursday and Friday sends, epoch timestamp, no `last_interaction`, invalid timezone | always 08:00–21:00 local. Tour days are named in the right week, and both days fall in the same week |
+| Channel | SMS preferred but only email consented, empty preferences, voice only, Spanish voice | first **consented** channel |
+| Content | preferred name, Unicode name with a long property name, unknown amenity, PII and protected classes in the profile, unsupported language (fr) | preferred name used, no PII or protected attributes in the copy, falls back to English |
+| Other CTAs | resident pay rent (SMS), maintenance (email), Spanish resident variants | generic copy with a link or reply prompt, Spanish when `language` is `es` |
+| Bad input | a malformed JSON line | still gets an output line, with `manual_review` |
+
 ## What was measured
 
 All numbers below come from this laptop.
@@ -97,7 +113,13 @@ All numbers below come from this laptop.
 - **Samples, Ollama qwen2.5:7b, leave-one-out:** with `--decisions llm`, 1/2 pass. With only one example to learn from (an email case), the LLM chose email for the SMS case. That's a legal choice, so the checks accepted it. This is the real cost of learning decisions from tiny data. With `--decisions rules`, 2/2 pass.
 - **12-record rehearsal (`data/holdout_rehearsal.jsonl`, no `expected`), Ollama:** 12/12 valid outputs, and `--require-llm` passed (all 8 sent messages were written by the LLM). p95 latency was about 22 s, which **fails** the 2000 ms threshold. The offline path takes about 3 ms.
 - **Reply classifier:** macro F1 was 0.921 on 42 replies I labelled myself (`data/reply_labels.jsonl`) before measuring. After fixing a real rule-order bug it found ("reschedule my tour" was classified as a tour request), it scores 0.975 on the same set. That second number is optimistic, because the set is small, hand-written, and was used for the fix.
-- **OpenAI path:** tested only against a local fake server, which checked the request shape and the fallback. It has not been run against OpenAI itself. Run it with `--require-llm` and a real key before relying on it.
+- **OpenAI (gpt-5-mini), samples, leave-one-out, judged by an OpenAI LLM judge:** with `--decisions llm`, 1/2 pass. It made the same email-for-SMS choice as Ollama. With `--decisions rules`, **2/2 pass**, and the judge rated both messages semantically equivalent to `expected`. p95 latency was about 9.6 s.
+- **12-record rehearsal, OpenAI, `--decisions rules`:** 12/12 valid outputs, and `--require-llm` passed (all 8 sent messages were written by the LLM on the first attempt). p95 latency was about 10 s, which **fails** the 2000 ms threshold.
+- **Bugs that rehearsal found, now fixed:**
+  - SMS tour messages said "this week" while the offered days fell next week. A Thursday send offering Mon/Tue is one example. The phrase is now corrected automatically, and a guardrail rejects the wrong week.
+  - The Spanish move timing came out in English ("a mid‑January"). It's now localized ("mediados de enero").
+  - Spanish messages must now open with a Spanish greeting.
+  - The tour-CTA check now accepts "agendar" and "cita".
 
 ## Talking points / trade-offs
 

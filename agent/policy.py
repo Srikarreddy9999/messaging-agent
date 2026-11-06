@@ -44,7 +44,7 @@ OPT_OUT_TEXT = {
     "es": {
         "sms": "Responde STOP para cancelar.",
         "email": "Para dejar de recibir correos, haz clic aquí o responde STOP.",
-        "voice": "Para no recibir más llamadas, diga 'stop' o presione 9.",
+        "voice": "Para no recibir más llamadas, di 'stop' o presiona 9.",
     },
 }
 
@@ -274,6 +274,10 @@ def decide(record: dict, now: datetime | None = None) -> Decision:
     return with_channel_and_time(d, record, channel, send_dt)
 
 
+def _week(day) -> tuple:
+    return tuple(day.isocalendar()[:2])
+
+
 def with_channel_and_time(d: Decision, record: dict, channel: str, send_dt: datetime) -> Decision:
     """Recompute everything that depends on channel and send time (opt-out text, CTA options/link)."""
     from dataclasses import replace
@@ -283,14 +287,19 @@ def with_channel_and_time(d: Decision, record: dict, channel: str, send_dt: date
     if d.cta_type == "schedule_tour":
         if channel == "sms":
             # two weekdays at least 2 days after the send day -> numbered reply options (sample 1 pattern)
-            day = send_day + timedelta(days=2)
-            days_es = ["lunes", "martes", "miércoles", "jueves", "viernes"]
-            while len(options) < 2:
+            days, day = [], send_day + timedelta(days=2)
+            while len(days) < 2:
                 if day.weekday() < 5:
-                    options.append(day.strftime("%a"))
-                    labels.append(days_es[day.weekday()] if d.language == "es" else day.strftime("%A"))
-                    same_week = same_week and day.isocalendar()[1] == send_day.isocalendar()[1]
+                    days.append(day)
                 day += timedelta(days=1)
+            if _week(days[0]) != _week(days[1]):
+                # split across weeks (e.g. Fri + Mon): offer Mon/Tue of the following week, so one week is named
+                monday = days[1] - timedelta(days=days[1].weekday())
+                days = [monday, monday + timedelta(days=1)]
+            days_es = ["lunes", "martes", "miércoles", "jueves", "viernes"]
+            options = [x.strftime("%a") for x in days]
+            labels = [days_es[x.weekday()] if d.language == "es" else x.strftime("%A") for x in days]
+            same_week = _week(days[0]) == _week(send_day)
         else:
             link = property_link(inp.get("property_name"), "tour")
     elif d.cta_type and channel == "email":

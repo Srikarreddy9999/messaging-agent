@@ -18,7 +18,7 @@ MONTHS_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "ag
              "septiembre", "octubre", "noviembre", "diciembre"]
 AMENITY_PHRASE = {"pool": "pool", "fitness": "24/7 fitness center", "gym": "24/7 fitness center",
                   "dog_park": "dog park", "pet": "pet-friendly amenities", "parking": "covered parking",
-                  "coworking": "coworking lounge", "rooftop": "rooftop deck"}
+                  "coworking": "coworking lounge", "rooftop": "rooftop deck", "ev_charging": "EV charging"}
 AMENITY_SHORT = {"fitness": "fitness rooms", "gym": "fitness rooms"}
 
 
@@ -28,13 +28,19 @@ def _join(items: list[str], conj: str = "and") -> str:
     return ", ".join(items[:-1]) + f" {conj} " + items[-1]
 
 
-def _move_phrase(move) -> str | None:
+MONTHS_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+             "septiembre", "octubre", "noviembre", "diciembre"]
+
+
+def _move_phrase(move, lang: str = "en") -> str | None:
     try:
         d = date.fromisoformat(str(move)[:10])
     except (TypeError, ValueError):
         return None
-    part = "early" if d.day <= 10 else "mid" if d.day <= 20 else "late"
-    return f"{part}\u2011{d.strftime('%B')}"  # non-breaking hyphen, matches sample style
+    third = 0 if d.day <= 10 else 1 if d.day <= 20 else 2
+    if lang == "es":
+        return f"{['principios', 'mediados', 'finales'][third]} de {MONTHS_ES[d.month - 1]}"
+    return f"{['early', 'mid', 'late'][third]}\u2011{d.strftime('%B')}"  # non-breaking hyphen, matches sample style
 
 
 # Generic phrasing for CTAs other than tours (not in the samples; kept plain and neutral).
@@ -43,6 +49,13 @@ CTA_PHRASE = {
     "renew_lease": ("Your lease renewal options are ready to review.", "Review renewal"),
     "pay_rent": ("A quick reminder that rent is due soon.", "Pay now"),
     "submit_maintenance": ("Need something fixed? Submit a maintenance request anytime.", "Submit request"),
+}
+
+CTA_PHRASE_ES = {
+    "apply_now": ("¿Listo para aplicar? Puedes iniciar tu solicitud en línea.", "Aplicar ahora"),
+    "renew_lease": ("Tus opciones de renovación de contrato ya están listas.", "Ver renovación"),
+    "pay_rent": ("Un recordatorio rápido: la renta vence pronto.", "Pagar ahora"),
+    "submit_maintenance": ("¿Necesitas una reparación? Envía una solicitud de mantenimiento cuando quieras.", "Enviar solicitud"),
 }
 
 
@@ -83,17 +96,23 @@ def compose_template(record: dict, d: Decision) -> dict:
                 body = f"{opener} Tours are available {when_en}. Would you like to book a time on {l1} or {l2}? Reply 1 for {o1}, 2 for {o2}. {d.opt_out_text}"
             cta["options"] = list(d.cta_options)
         else:
-            line, _ = CTA_PHRASE.get(d.cta_type, ("Reply with any questions—we’re happy to help.", ""))
-            body = f"{hi}—a quick note from {prop}. {line} {d.opt_out_text}"
+            if es:
+                line, _ = CTA_PHRASE_ES.get(d.cta_type, ("Responde con cualquier pregunta—con gusto te ayudamos.", ""))
+                body = f"{hola}—un mensaje rápido de {prop}. {line} {d.opt_out_text}"
+            else:
+                line, _ = CTA_PHRASE.get(d.cta_type, ("Reply with any questions—we’re happy to help.", ""))
+                body = f"{hi}—a quick note from {prop}. {line} {d.opt_out_text}"
     elif d.channel == "email":
         am_long = [AMENITY_PHRASE.get(a, a.replace("_", " ")) for a in amenities]
         am_short = [AMENITY_SHORT.get(a, AMENITY_PHRASE.get(a, a.replace("_", " "))) for a in amenities]
-        move = _move_phrase(inp.get("move_date_target")) if d.horizon != "unknown" else None
+        move = _move_phrase(inp.get("move_date_target"), d.language) if d.horizon != "unknown" else None
         link_line = lambda label: [f"{label} → {d.cta_link}"] if d.cta_link else []
         if not tour:
-            line, label = CTA_PHRASE.get(d.cta_type, (f"Here’s a quick update from {prop}.", "Learn more"))
-            subject = f"{prop}—{label}" if d.cta_type in CTA_PHRASE else f"An update from {prop}"
-            lines = [f"{hi},", line] + link_line(label) + [d.opt_out_text]
+            phrases = CTA_PHRASE_ES if es else CTA_PHRASE
+            fallback = (f"Una actualización rápida de {prop}.", "Más información") if es else (f"Here’s a quick update from {prop}.", "Learn more")
+            line, label = phrases.get(d.cta_type, fallback)
+            subject = f"{prop}—{label}" if d.cta_type in phrases else (f"Novedades de {prop}" if es else f"An update from {prop}")
+            lines = [f"{hola if es else hi},", line] + link_line(label) + [d.opt_out_text]
         elif es:
             subject = f"Visita {prop}—conoce lo que te interesa"
             lines = [f"{hola},", f"Reserva una visita esta semana para comparar planos en {prop}."] + link_line("Reservar") + [d.opt_out_text]
@@ -108,8 +127,12 @@ def compose_template(record: dict, d: Decision) -> dict:
         if d.cta_link:
             cta["link"] = d.cta_link
     else:  # voice script
-        ask = "call us back to book a tour this week" if tour else "call us back anytime with questions"
-        body = f"{hi}, this is the team at {prop}—{ask}. {d.opt_out_text}"
+        if es:
+            ask = "llámanos para reservar una visita" if tour else "llámanos cuando quieras si tienes preguntas"
+            body = f"{hola}, te habla el equipo de {prop}—{ask}. {d.opt_out_text}"
+        else:
+            ask = "call us back to book a tour" if tour else "call us back anytime with questions"
+            body = f"{hi}, this is the team at {prop}—{ask}. {d.opt_out_text}"
         cta = {"type": d.cta_type or "callback"}
 
     return {"channel": d.channel, "send_at": d.send_at, "subject": subject, "body": body, "cta": cta}
@@ -224,7 +247,7 @@ def build_user_prompt(record: dict, d: Decision, examples: list[dict], feedback:
                                  "tour_days_are_this_week": dc.cta_same_week}
     policy = {
         "hard_limits": hard_limits, "defaults": defaults, "cta_by_channel": cta_by_channel,
-        "move_timing": _move_phrase(inp.get("move_date_target")),
+        "move_timing": _move_phrase(inp.get("move_date_target"), d.language),
         "first_name": (inp.get("profile") or {}).get("first_name"),
     }
     user = (f"<examples>\n{shots}\n</examples>\n\n"
@@ -232,7 +255,9 @@ def build_user_prompt(record: dict, d: Decision, examples: list[dict], feedback:
             f"<record>{json.dumps(_without_expected(record), ensure_ascii=False)}</record>\n\n"
             f"Write the message in language '{d.language}'. Personalize with the first name and any stated "
             f"interests in the record (not the examples' names, days or interests). If first_name is null, "
-            f"greet with 'Hi there'. Describe the move date using move_timing exactly. Output JSON only.")
+            f"greet with 'Hi there'. Describe the move date using move_timing exactly. If the channel's "
+            f"tour_days_are_this_week is false, the tour days are NEXT week: never say 'this week' about them. "
+            f"Output JSON only.")
     if feedback:
         user += "\n\nYour previous draft failed these compliance checks; fix them:\n- " + "\n- ".join(feedback)
     return user

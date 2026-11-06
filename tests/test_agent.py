@@ -127,6 +127,89 @@ def test_review_regressions():
     assert out["violations"] == [] and "fair_housing_check_passed" in out["states"]
 
 
+
+def test_week_wording_and_spanish_move():
+    from agent.composer import _move_phrase
+    from agent.guardrails import check
+    from agent.policy import decide
+    assert _move_phrase("2026-01-20", "es") == "mediados de enero"
+    assert _move_phrase("2026-01-25") == "late\u2011January"
+    # Thursday send -> Mon/Tue options are next week
+    rec = {"task_id": "t_day1", "persona": "prospect", "lifecycle_stage": "new",
+           "consent": {"sms_opt_in": True}, "channel_preferences": ["sms"],
+           "input": {"property_name": "Oak Ridge Apartments", "move_date_target": "2026-01-25",
+                     "last_interaction": "2025-12-10T18:00:00Z", "timezone": "America/Chicago",
+                     "language": "en", "profile": {"first_name": "Morgan"}},
+           "assertions": {"constraints": {"primary_cta": "book_tour", "include_opt_out_instructions": True}}}
+    d = decide(rec)
+    assert d.cta_options == ["Mon", "Tue"] and not d.cta_same_week
+    bad = {"channel": "sms", "subject": None, "cta": {"type": "schedule_tour"},
+           "body": "Hi Morgan—tours are available this week. Reply 1 for Mon, 2 for Tue. Reply STOP to opt out."}
+    assert any("next week" in v for v in check(rec, d, bad)[1])
+    from agent.guardrails import fix_week_wording
+    fixed = dict(bad)
+    assert fix_week_wording(fixed, d) and "next week" in fixed["body"] and "this week" not in fixed["body"]
+    good = dict(bad, body=bad["body"].replace("this week", "next week"))
+    assert not any("week" in v for v in check(rec, d, good)[1])
+    # offline template already gets it right, in both languages
+    out = MessagingAgent(examples=SAMPLE).run(rec)
+    assert "next week" in out["next_message"]["body"] and out["violations"] == []
+    rec_es = json.loads(json.dumps(rec)); rec_es["input"]["language"] = "es"
+    body_es = MessagingAgent(examples=SAMPLE).run(rec_es)["next_message"]["body"]
+    assert "la próxima semana" in body_es and "January" not in body_es
+    d_es = decide(rec_es)
+    hi_es = {"channel": "sms", "subject": None, "cta": {"type": "schedule_tour"},
+             "body": "Hi Morgan—visita la próxima semana. Responde 1 para lunes, 2 para martes. Responde STOP para cancelar."}
+    assert any("Spanish greeting" in v for v in check(rec_es, d_es, hi_es)[1])
+
+
+def test_edge_cases_file():
+    """Every record in data/edge_cases.jsonl gets a valid answer with the expected behaviour (offline)."""
+    import io, contextlib
+    from run import load_jsonl
+    with contextlib.redirect_stderr(io.StringIO()):
+        records = load_jsonl(str(DATA / "edge_cases.jsonl"))
+    agent = MessagingAgent(examples=SAMPLE)
+    out = {}
+    for r in records:
+        try:
+            o = agent.run(r)
+        except Exception as e:  # run.py turns these into manual_review; here it must not happen except bad JSON
+            assert "__invalid_line__" in r, (r.get("task_id"), e)
+            continue
+        out[o["task_id"]] = o
+    suppressed = {"prospect_no_consent": "no_consented_channel", "sparse_record": "no_consented_channel",
+                  "do_not_contact_flag": "opted_out", "lifecycle_closed_lost": "lifecycle_stage=closed_lost",
+                  "consent_as_strings_is_not_consent": "no_consented_channel"}
+    for tid, reason in suppressed.items():
+        assert out[tid]["next_message"] is None and out[tid]["next_action"]["reason"] == reason, tid
+    for tid in ("prospect_stop_reply", "reply_spanish_opt_out"):
+        assert out[tid]["next_action"]["type"] == "opt_out" and "unsubscribed" in out[tid]["next_message"]["body"], tid
+    assert out["reply_not_interested"]["next_message"] is None
+    assert out["reply_not_interested"]["next_action"]["type"] == "close_lead"
+    assert out["reply_select_option_1"]["next_action"]["type"] == "confirm_tour"
+    for tid in ("reply_reschedule", "reply_general_question", "reply_stop_by_is_not_opt_out"):
+        assert out[tid]["next_action"]["type"] == "handoff_to_leasing_agent", tid
+    for tid in ("late_night_last_interaction_day0", "thursday_send_tour_days_next_week_day1", "friday_send_day1"):
+        body = out[tid]["next_message"]["body"]
+        assert "next week" in body and "this week" not in body and "Reply 1 for Mon, 2 for Tue" in body, tid
+    assert out["prospect_sms_pref_but_only_email_consent"]["next_message"]["channel"] == "email"
+    assert out["empty_preferences_uses_consented_channel"]["next_message"]["channel"] == "sms"
+    assert out["invalid_timezone_day1"]["next_message"]["send_at"].endswith("-06:00")
+    assert "Hi Xander" in out["preferred_name_used"]["next_message"]["body"]
+    assert "EV charging" in out["unknown_amenity"]["next_message"]["body"]
+    leak = out["pii_and_protected_in_profile"]["next_message"]["body"].lower()
+    assert not any(w in leak for w in ("pregnant", "wheelchair", "mexico", "555", "123-45", "maria@"))
+    assert out["voice_spanish"]["next_message"]["body"].startswith("Hola")
+    assert out["unsupported_language_falls_back_to_english"]["next_message"]["body"].startswith("Hi ")
+    for tid, o in out.items():
+        m = o["next_message"]
+        assert o["violations"] == [], (tid, o["violations"])
+        if m and m["send_at"] != "immediate":
+            hour = int(m["send_at"][11:13])
+            assert 8 <= hour < 21, (tid, m["send_at"])
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
