@@ -72,13 +72,17 @@ def apply_brand_style(text: str) -> str:
 
 
 def fix_week_wording(message: dict, decision) -> bool:
-    """The samples say 'this week'; when the offered tour days fall next week, correct that phrase in place.
+    """Name the right week for the offered tour days, correcting the phrase in place.
     Deterministic, like brand style: a factual fix that doesn't need another LLM round trip."""
     body = message.get("body") or ""
-    if message.get("channel") != "sms" or not decision.cta_options or decision.cta_same_week:
+    if message.get("channel") != "sms" or not decision.cta_options:
         return False
-    fixed = re.sub(r"\bthis week\b", "next week", body, flags=re.I)
-    fixed = re.sub(r"\besta semana\b", "la próxima semana", fixed, flags=re.I)
+    if decision.cta_same_week:
+        fixed = re.sub(r"\bnext week\b", "this week", body, flags=re.I)
+        fixed = re.sub(r"\b(la )?pr[oó]xima semana\b", "esta semana", fixed, flags=re.I)
+    else:
+        fixed = re.sub(r"\bthis week\b", "next week", body, flags=re.I)
+        fixed = re.sub(r"\besta semana\b", "la próxima semana", fixed, flags=re.I)
     message["body"] = fixed
     return fixed != body
 

@@ -149,6 +149,12 @@ def test_week_wording_and_spanish_move():
     from agent.guardrails import fix_week_wording
     fixed = dict(bad)
     assert fix_week_wording(fixed, d) and "next week" in fixed["body"] and "this week" not in fixed["body"]
+    # reverse direction: Tuesday send -> Thu/Fri are this week
+    rec_tue = json.loads(json.dumps(rec)); rec_tue["input"]["last_interaction"] = "2025-12-08T16:00:00Z"
+    d_tue = decide(rec_tue)
+    assert d_tue.cta_options == ["Thu", "Fri"] and d_tue.cta_same_week
+    wrong = dict(bad, body="Hi Morgan—tours open la próxima semana and next week. Reply 1 for Thu, 2 for Fri. Reply STOP to opt out.")
+    assert fix_week_wording(wrong, d_tue) and "next week" not in wrong["body"] and "esta semana" in wrong["body"]
     good = dict(bad, body=bad["body"].replace("this week", "next week"))
     assert not any("week" in v for v in check(rec, d, good)[1])
     # offline template already gets it right, in both languages

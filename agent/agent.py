@@ -126,7 +126,8 @@ class MessagingAgent:
                         return self._result(record, None, next_action, rationale, [], [], reply_label, source,
                                             t0, trace, decided_by)
                     if guardrails.fix_week_wording(message, d_eff):
-                        trace.append(f"tour options {d_eff.cta_options} fall next week: changed 'this week' to 'next week'")
+                        trace.append(f"tour options {d_eff.cta_options}: corrected week wording to "
+                                     f"'{'this' if d_eff.cta_same_week else 'next'} week'")
                     _, violations = guardrails.check(record, d_eff, message)
                     if not violations:
                         break

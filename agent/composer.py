@@ -255,9 +255,11 @@ def build_user_prompt(record: dict, d: Decision, examples: list[dict], feedback:
             f"<record>{json.dumps(_without_expected(record), ensure_ascii=False)}</record>\n\n"
             f"Write the message in language '{d.language}'. Personalize with the first name and any stated "
             f"interests in the record (not the examples' names, days or interests). If first_name is null, "
-            f"greet with 'Hi there'. Describe the move date using move_timing exactly. If the channel's "
-            f"tour_days_are_this_week is false, the tour days are NEXT week: never say 'this week' about them. "
-            f"Output JSON only.")
+            f"greet with 'Hi there'. Describe the move date using move_timing exactly. Week wording: only for "
+            f"SMS numbered tour days, say 'next week' when that channel's tour_days_are_this_week is false; "
+            f"otherwise (and always for email and voice) say 'this week' as the examples do. "
+            f"State only facts present in the record or decision_context: do not invent availability, prices, "
+            f"specials, or what the contact liked or did. Output JSON only.")
     if feedback:
         user += "\n\nYour previous draft failed these compliance checks; fix them:\n- " + "\n- ".join(feedback)
     return user
